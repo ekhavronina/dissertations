@@ -1,0 +1,167 @@
+---
+title: "rgsu"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Загружаем библиотеки
+
+```{r}
+library(rJava)
+library(mallet)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+options(java.parameters = "-Xmx1g")
+```
+
+Загружаем файлы
+
+```{r}
+
+rgsu.meta <- read_csv("rgsu.csv")
+
+rgsu.meta1 <- rgsu.meta %>%
+  rename(file = `link-href`)
+rgsu.meta2 <- rgsu.meta1 %>% 
+  mutate(filename = str_trunc(file, 11, ellipsis = "", side = "left"))
+rgsu.meta3 <- rgsu.meta2 %>%
+  select("author", "title", "filename")
+
+
+rgsu.files <- paste("~/rgsu/rsl", rgsu.meta3$filename, sep="")
+rgsu.files1 <- rgsu.files %>% paste(".txt", sep = "")
+
+names(rgsu.files1) <- rgsu.meta3$filename
+
+rgsu.df <- bind_rows(lapply(rgsu.files1, read_file), .id="filename")
+rgsu.df1 <- t(rgsu.df)
+rgsu.df2 <- tibble(rgsu.df1)
+
+rgsu <- bind_cols(rgsu.df2, rgsu.meta3) %>%
+  rename(text = rgsu.df1) %>%
+  select(author, title, filename, text) %>%
+  mutate(year = str_trunc(title, 13, ellipsis = "", side = "left")) %>%
+  mutate(year = str_trunc(year, 4, ellipsis = ""))
+
+rgsu[134, 5] <- "2019"
+rgsu$year <- parse_number(rgsu$year)
+```
+
+Препроцессинг
+
+```{r}
+
+# удаляем название университета
+rgsu <- rgsu %>%
+  filter(str_detect(title, pattern = "Рос. гос. социал. ун-т|РГСУ|Российский государственный социальный"))
+View(head(rgsu))
+View(rgsu %>% select(title, year))
+
+rgsu$clean <- gsub("[[:punct:]]", " ", rgsu$text)
+rgsu$clean <- str_replace_all(rgsu$clean, "[0-9]+", " ")
+rgsu$clean <- str_replace_all(rgsu$clean, "\n", " ")
+View(head(rgsu))
+
+rgsu$clean <- system2("mystem", c("-d", "-l", "-c", "-ig"), input = rgsu$clean, stdout = TRUE)
+
+rgsu.gram <- rgsu %>% unnest_tokens(gram, clean, token = stringr::str_extract_all, pattern="\\w+=[A-Z]+,*(имя|фам|отч)*")
+
+rgsu.freq <- rgsu.gram %>% count(gram, sort=TRUE)
+
+
+View(head(rgsu.gram))
+View(head(rgsu))
+
+rgsu.lempos <- rgsu.gram %>%
+  separate(gram, c("lemma", "pos"), sep = "=") %>%
+  separate(pos, c("pos", "prop"), sep = ",")
+
+View(head(rgsu.lempos))
+
+stopwords1 <- read_csv("stopwords1.csv")         # загружаем свой список стоп-слов
+
+rgsu.clean <- rgsu.lempos %>% 
+  filter(pos %in% c("s", "v", "a", "adv")) %>%
+  filter(!str_detect(prop, "имя|фам|отч")) %>%   # удаляем имена
+  filter(!lemma %in% stopwords1$word) %>%
+  mutate(id = row_number() %/% 500)              # создаем фрагменты по 500 слов
+
+
+View(head(rgsu.clean))
+
+rgsu.text <- rgsu.clean %>%
+  group_by(filename, id) %>%
+  summarize(text = paste(lemma, collapse=" ")) %>%
+  mutate(docid = paste(filename, id, sep="."))
+
+View(head(rgsu.text))
+nrow(rgsu.text)
+
+```
+
+Тематическое моделирование
+
+```{r}
+library(stopwords)
+library(mallet)
+
+# загружаем стопслова
+
+write_lines(stopwords("ru"), "stopwords.txt")
+
+
+mallet.instances.rgsu <- mallet.import(id.array=rgsu.text$docid,
+                                  text.array=rgsu.text$text,
+                                  stoplist="stopwords.txt")
+
+topic.model.rgsu <- MalletLDA(num.topics=20) # 20 тем
+topic.model.rgsu$loadDocuments(mallet.instances.rgsu) 
+topic.model.rgsu$setAlphaOptimization(20, 50) 
+
+vocabulary.rgsu <- topic.model.rgsu$getVocabulary() # словарь корпуса
+word.freqs.rgsu <- mallet.word.freqs(topic.model.rgsu) # частотности
+
+word.freqs.rgsu %>% arrange(desc(doc.freq)) %>% head(10)
+
+# тренируем модель 
+
+topic.model.rgsu$train(500)
+topic.model.rgsu$maximize(10)
+doc.topics.rgsu <- mallet.doc.topics(topic.model.rgsu, smoothed=TRUE, normalized=TRUE)
+topic.words.rgsu <- mallet.topic.words(topic.model.rgsu, smoothed=TRUE, normalized=TRUE)
+topic.labels.rgsu <- mallet.topic.labels(topic.model.rgsu, topic.words.rgsu, 5)
+
+for (k in 1:nrow(topic.words.rgsu)) {
+    top <- paste(mallet.top.words(topic.model.rgsu, topic.words.rgsu[k,], 30)$words,collapse=" ")
+    cat(paste(k, top, "\n"))
+}
+
+top.docs.rgsu <- function(doc.topics.rgsu, topic, docs, top.n=10) {
+    head(docs[order(-doc.topics.rgsu[,topic])], top.n)
+}
+
+
+top.docs.rgsu(doc.topics.rgsu, 1, rgsu.text$text)
+plot(mallet.topic.hclust(doc.topics.rgsu, topic.words.rgsu, 0), labels=topic.labels.rgsu)
+```
+
+Создаем json
+
+```{r}
+library(LDAvis)
+library(servr)
+
+doc.length.rgsu <- str_count(rgsu.text$text, boundary("word"))
+doc.length.rgsu[doc.length.rgsu==0] <- 0.000001
+
+
+json <- createJSON(phi = topic.words.rgsu, theta=doc.topics.rgsu, doc.length=doc.length.rgsu, vocab=vocabulary.rgsu, term.frequency=word.freqs.rgsu$term.freq)
+
+serVis(json, out.dir="rgsu20", open.browser=TRUE)
+```
+```

@@ -1,0 +1,287 @@
+---
+title: "dissers2"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(rJava)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(tidytext)
+library(quanteda)
+library(purrr)
+library(caret)
+library(glmnet)
+library(e1071)
+options(java.parameters = "-Xmx1g")
+
+```
+
+Корпус РГСУ. Загружаем и делаем препроцессинг 
+
+```{r}
+
+rgsu.meta <- read_csv("rgsu.csv")
+
+rgsu.meta1 <- rgsu.meta %>%
+  rename(file = `link-href`)
+rgsu.meta2 <- rgsu.meta1 %>% 
+  mutate(filename = str_trunc(file, 11, ellipsis = "", side = "left"))
+rgsu.meta3 <- rgsu.meta2 %>%
+  select("author", "title", "filename")
+
+
+rgsu.files <- paste("~/rgsu/rsl", rgsu.meta3$filename, sep="")
+rgsu.files1 <- rgsu.files %>% paste(".txt", sep = "")
+
+names(rgsu.files1) <- rgsu.meta3$filename
+
+rgsu.df <- bind_rows(lapply(rgsu.files1, read_file), .id="filename")
+rgsu.df1 <- t(rgsu.df)
+rgsu.df2 <- tibble(rgsu.df1)
+
+rgsu <- bind_cols(rgsu.df2, rgsu.meta3) %>%
+  rename(text = rgsu.df1) %>%
+  select(author, title, filename, text) %>%
+  mutate(year = str_trunc(title, 13, ellipsis = "", side = "left")) %>%
+  mutate(year = str_trunc(year, 4, ellipsis = ""))
+
+rgsu[134, 5] <- "2019"
+rgsu$year <- parse_number(rgsu$year)
+
+rgsu <- rgsu %>%
+  filter(str_detect(title, pattern = "Рос. гос. социал. ун-т|РГСУ|Российский государственный социальный"))
+
+rgsu$clean <- gsub("[[:punct:]]", " ", rgsu$text)
+rgsu$clean <- str_replace_all(rgsu$clean, "[0-9]+", " ")
+rgsu$clean <- str_replace_all(rgsu$clean, "\n", " ")
+View(head(rgsu))
+
+rgsu$clean <- system2("mystem", c("-d", "-l", "-c", "-ig"), input = rgsu$clean, stdout = TRUE)
+
+rgsu.gram <- rgsu %>% unnest_tokens(gram, clean, token = stringr::str_extract_all, pattern="\\w+=[A-Z]+,*(имя|фам|отч)*")
+
+View(head(rgsu.gram))
+View(head(rgsu))
+
+rgsu.lempos <- rgsu.gram %>%
+  separate(gram, c("lemma", "pos"), sep = "=") %>%
+  separate(pos, c("pos", "prop"), sep = ",")
+
+View(head(rgsu.lempos))
+
+
+stopwords1 <- read_csv("stopwords1.csv")
+
+
+rgsu.clean <- rgsu.lempos %>% 
+  filter(pos %in% c("s", "v", "a", "adv")) %>%
+  filter(!str_detect(prop, "имя|фам|отч")) %>%
+  filter(!lemma %in% stopwords1$word)
+
+
+View(head(rgsu.clean))
+
+rgsu.text <- rgsu.clean %>%
+  group_by(filename) %>%
+  select(title, author, year, lemma, filename) %>%
+  mutate(uni = "РГСУ")
+
+
+```
+
+Корпус РГГУ
+
+```{r}
+
+rggu.meta <- read_csv("rggu.csv")
+
+rggu.meta1 <- rggu.meta %>%
+  rename(file = `link-href`)
+rggu.meta2 <- rggu.meta1 %>% 
+  mutate(filename = str_trunc(file, 11, ellipsis = "", side = "left"))
+rggu.meta3 <- rggu.meta2 %>%
+  select("author", "title", "filename")
+
+
+rggu.files <- paste("~/rggu/rsl", rggu.meta3$filename, sep="")
+rggu.files1 <- rggu.files %>% paste(".txt", sep = "")
+
+names(rggu.files1) <- rggu.meta3$filename
+
+rggu.df <- bind_rows(lapply(rggu.files1, read_file), .id="filename")
+rggu.df1 <- t(rggu.df)
+rggu.df2 <- tibble(rggu.df1)
+
+rggu <- bind_cols(rggu.df2, rggu.meta3) %>%
+  rename(text = rggu.df1) %>%
+  select(author, title, filename, text) %>%
+  mutate(year = str_trunc(title, 13, ellipsis = "", side = "left")) %>%
+  mutate(year = str_trunc(year, 4, ellipsis = ""))
+
+
+rggu[24, 5] <- "2010"
+rggu[108, 5] <- "2019"
+rggu[117, 5] <- "2022"
+rggu[128, 5] <- "2022"
+rggu[215, 5] <- "2019"
+rggu[258, 5] <- "2020"
+rggu[24, 5] <- "2010"
+
+rggu$year <- parse_number(rggu$year)
+
+
+rggu <- rggu %>%
+  filter(str_detect(title, pattern = "Рос. гос. гуманитар. ун-т|РГГУ|Российский государственный гуманитарный")) %>%
+  filter(year > 2005) %>%
+  filter(year < 2014)
+
+rggu <- rggu %>%
+  sample_n(35)
+
+rggu$clean <- gsub("[[:punct:]]", " ", rggu$text)
+rggu$clean <- str_replace_all(rggu$clean, "[0-9]+", " ")
+rggu$clean <- str_replace_all(rggu$clean, "\n", " ")
+View(head(rggu))
+
+rggu$clean <- system2("mystem", c("-d", "-l", "-c", "-ig"), input = rggu$clean, stdout = TRUE)
+
+rggu.gram <- rggu %>% unnest_tokens(gram, clean, token = stringr::str_extract_all, pattern="\\w+=[A-Z]+,*(имя|фам|отч)*")
+
+View(head(rggu.gram))
+View(head(rggu))
+
+rggu.lempos <- rggu.gram %>%
+  separate(gram, c("lemma", "pos"), sep = "=") %>%
+  separate(pos, c("pos", "prop"), sep = ",")
+
+View(head(rggu.lempos))
+
+
+rggu.clean <- rggu.lempos %>% 
+  filter(pos %in% c("s", "v", "a", "adv")) %>%
+  filter(!str_detect(prop, "имя|фам|отч")) %>%
+  filter(!lemma %in% stopwords1$word)
+
+View(head(rggu.clean))
+
+rggu.text <- rggu.clean %>%
+  group_by(filename) %>%
+  select(title, author, year, lemma, filename) %>%
+  mutate(uni = "РГГУ")
+
+```
+
+Объединяем корпусы РГГУ и РГСУ
+
+```{r}
+dissers <- bind_rows(rggu.text, rgsu.text)
+View(head(dissers))
+dissers <- dissers %>%
+  ungroup() %>%
+  mutate(id = row_number())
+View(tail(dissers))
+```
+
+Создаем терм-документную матрицу для обучения классификатора с помощью меры TF-IDF
+
+```{r}
+View(head(dissers))
+
+dis.longmeta <- dissers %>% 
+distinct(uni, id, title)
+
+
+dis.nested <- dissers %>%
+  tidyr::nest(lemma) %>%
+  mutate(text = map(data, unlist), 
+         text = map_chr(text, paste, collapse = " ")) 
+
+
+dis.dtm <- dissers %>%
+    count(id, lemma) %>%
+    bind_tf_idf(lemma, id, n) %>% 
+    cast_dfm(id, lemma, tf_idf)
+dis.dtm
+
+dis.clean <- dis.dtm %>%
+    dfm_wordstem(language = "ru") %>%
+    dfm_trim(min_docfreq=0.10) 
+dis.clean
+
+```
+
+Делим корпус на тестовый и тренировочный (10% выборка)
+
+```{r}
+
+set.seed(17)
+
+split <- createDataPartition(y = dis.nested$uni, p = 0.9, list = FALSE)
+train.data <- dis.clean %>% dfm_subset(rownames(dis.clean) %in% dis.longmeta$id[split])
+test.data <- dis.clean %>% dfm_subset(!rownames(dis.clean) %in% dis.longmeta$id[split]) 
+response <- as.factor(dis.nested$uni)
+trainY <- response[split]
+testY <- response[-split]
+
+View(tail(dis.longmeta))
+
+```
+
+Обучаем модель
+
+```{r}
+cv.ridge <- cv.glmnet(x = train.data, y = trainY, alpha=0, family="binomial", type.measure="auc", nfolds = 5, lambda = seq(0.001,0.1,by = 0.001), standardize=FALSE)
+
+
+cv.lasso <- cv.glmnet(x = train.data, y = trainY, alpha=1, family="binomial", type.measure="auc", nfolds = 5, lambda = seq(0.001,0.1,by = 0.001), standardize=FALSE)
+
+
+cv.elasticnet <- cv.glmnet(x = train.data, y = trainY, family = "binomial", type.measure="auc", nfolds = 5, standardize=FALSE)
+```
+
+Предсказываем, в каком университете написана работа
+
+```{r}
+predicted.lasso <- as.factor(predict(cv.lasso, test.data, type="class"))
+
+cm.lasso <- confusionMatrix(data = predicted.lasso, reference = testY, positive="РГГУ")
+cm.lasso
+
+
+predicted.ridge <- as.factor(predict(cv.ridge, test.data, type="class"))
+cm.ridge <- confusionMatrix(data = predicted.ridge, reference = testY, positive="РГГУ")
+cm.ridge
+
+
+predicted.elasticnet <- as.factor(predict(cv.elasticnet, test.data, type="class"))
+cm.elasticnet <- confusionMatrix(data = predicted.elasticnet, reference = testY, positive="РГГУ")
+cm.elasticnet
+```
+
+Анализируем ошибки
+
+```{r}
+test.df <- dissers[-split,]
+misclassified.rggu <- test.df[which(predicted.elasticnet == "РГСУ" & testY == "РГГУ"),]
+misclassified.rggu %>%
+    count(id, lemma) %>%
+    cast_dfm(id, lemma, n) %>%
+    textplot_wordcloud(min_count=2, ordered_color=TRUE)
+
+
+misclassified.rgsu <- test.df[which(predicted.ridge == "РГГУ" & testY == "РГСУ"),]
+misclassified.rgsu %>%
+    count(id, lemma) %>%
+    cast_dfm(id, lemma, n) %>%
+    textplot_wordcloud(min_count=10)
+```
+
+Модель звезд с неба не хватает
