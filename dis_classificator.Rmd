@@ -1,0 +1,422 @@
+---
+title: "Dissertations Notebook"
+output: html_notebook
+---
+
+Загружаем библиотеки
+
+```{r}
+library(mallet)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(tidytext)
+library(ggplot2)
+library(purrr)
+library(quanteda)
+library(quanteda.textplots)
+library(caret)
+library(glmnet)
+```
+
+Загрузим и подготовим корпусы авторефератов диссертаций, написанных или защищенных в РГСУ и РГГУ.
+Начнем с РГСУ:
+
+```{r}
+# рабочая директория
+getwd()
+setwd('C:/Users/79175/Documents/rwd/dissers/')
+
+# мета-данные содержат название, имя автора и ссылку
+rgsu.meta <- read_csv("rgsu.csv")
+
+# достаем из ссылок имена файлов с текстами авторефератов
+rgsu.meta <- rgsu.meta %>%
+  rename(file = `link-href`) %>% 
+  mutate(filename = str_trunc(file, 11, ellipsis = "", side = "left")) %>%
+  select("author", "title", "filename")
+
+# задаем пути к файлам
+rgsu.files <- paste("rgsu/rsl", rgsu.meta$filename, sep="")
+rgsu.files <- rgsu.files %>% paste(".txt", sep = "")
+names(rgsu.files) <- rgsu.meta$filename
+
+# загружаем тексты
+rgsu.texts <- bind_rows(lapply(rgsu.files, read_file), .id="filename")
+rgsu.texts <- t(rgsu.texts)
+rgsu.texts <- tibble(rgsu.texts)
+
+# объединяем тексты и мета-данные в датафрейм
+rgsu <- bind_cols(rgsu.texts, rgsu.meta) %>%
+  rename(text = rgsu.texts) %>%
+  select(author, title, filename, text) %>%
+  # достаем из названия год
+  mutate(year = str_trunc(title, 13, ellipsis = "", side = "left")) %>%
+  mutate(year = str_trunc(year, 4, ellipsis = ""))
+
+rgsu[134, 5] <- "2019"
+rgsu$year <- as.numeric(rgsu$year)
+
+str(rgsu)
+```
+
+Препроцессинг корпуса РГСУ
+
+
+Мы можем отфильтровать работы, оставив только те, у которых в колонке с названием указан университет, что значительно уменьшит корпус, но точно удалит работы, которые попали в результаты поискового запроса случайно.
+
+```{r}
+#rgsu <- rgsu %>%
+#  filter(str_detect(title, pattern = "Рос. гос. социал. ун-т|РГСУ|Российский государственный социальный"))
+
+
+# удаляем пунктуацию, цифры, разрывы строк, латиницу, лишние пробелы
+#rgsu$clean <- gsub("[^[:alnum:]\\.\\s]", " ", rgsu$text)
+rgsu$clean <- gsub("[[:punct:]]", " ", rgsu$text)
+rgsu$clean <- str_replace_all(rgsu$clean, "[0-9]+", " ")
+rgsu$clean <- str_replace_all(rgsu$clean, "[\\n\t\r]+", " ")
+rgsu$clean <- str_replace_all(rgsu$clean, "[A-Za-z]+", " ")
+rgsu$clean <- str_squish(rgsu$clean)
+
+head(rgsu, 2)
+```
+
+Для дальнейшего использования mystem я делю тексты на фрагменты по 50 слов. Так можно совершать параллельные вычисления. Также на моем ноутбуке возникает ошибка в работе mystem при слишком большой длине строк.
+
+```{r}
+#rgsu.sentences <- rgsu %>% 
+#  group_by(title, author, filename, year) %>% 
+#  unnest_sentences(clean, clean, strip_punct = T)
+#max(nchar(rgsu.sentences$clean))
+
+rgsu.words <- rgsu %>% 
+  unnest_tokens(word, clean) %>%  
+  mutate(id = row_number() %/% 50) %>% 
+  group_by(author, title, filename, id) %>%
+  summarize(clean = paste(word, collapse=" "))
+
+head(rgsu.words)
+
+```
+
+Используем mystem с определением частей речи и имен
+
+```{r}
+rgsu.words$clean <- system2("C:/Users/79175/Documents/rwd/mystem.exe", c("-d", "-l", "-c", "-ig"), input = rgsu.words$clean, stdout = TRUE)
+rgsu.words <- rgsu.words %>% ungroup()
+
+#write.csv(rgsu.words, "rgsu_words.csv", fileEncoding = "UTF-8")
+
+rgsu.gram <- rgsu.words %>% unnest_tokens(gram, clean, token = stringr::str_extract_all, pattern="\\w+=[A-Z]+,*(имя|фам|отч)*")
+
+head(rgsu.gram)
+```
+
+Частотности
+
+```{r}
+
+rgsu.freq <- rgsu.gram %>% count(gram, sort=TRUE)
+
+head(rgsu.freq, 20)
+
+```
+Разделим колонку со словами на лемму, часть речи и характеристики (ФИО), чтобы затем убрать последние. Тогда они не будут влиять на результаты обучения модели.
+
+```{r}
+rgsu.lempos <- rgsu.gram %>%
+  separate(gram, c("lemma", "pos"), sep = "=") %>%
+  separate(pos, c("pos", "prop"), sep = ",")
+
+head(rgsu.lempos)
+```
+
+Чистим корпус от имен и стоп-слов, делим на фрагменты для обучения модели.
+
+```{r}
+
+stopwords1 <- read_csv("stopwords1.csv")         # загружаем свой список стоп-слов
+
+rgsu.clean <- rgsu.lempos %>% 
+  filter(pos %in% c("s", "v", "a", "adv")) %>%
+  filter(!str_detect(prop, "имя|фам|отч")) %>%   # удаляем имена
+  filter(!lemma %in% stopwords1$word)
+
+# частотности почищенного корпуса
+rgsu.clean.freq <- rgsu.clean %>% count(lemma, sort=TRUE)
+
+head(rgsu.clean.freq, 20)
+```
+Делим на фрагменты по 500 слов для тематического моделирования
+
+```{r}
+rgsu500 <- rgsu.clean %>%
+  mutate(id = row_number() %/% 500) %>%              # создаем фрагменты по 500 слов
+  group_by(filename, id) %>%
+  summarize(text = paste(lemma, collapse=" ")) %>%   # объединяем слова в фрагменты по id
+  mutate(docid = paste(filename, id, sep="."))       # присваиваем фрагменту id + имя файла
+```
+
+Повторяем все то же самое со вторым корпусом, авторефератами РГГУ
+
+```{r}
+
+# мета-данные содержат название, имя автора и ссылку
+rggu.meta <- read_csv("rggu.csv")
+
+# достаем из ссылок имена файлов с текстами авторефератов
+rggu.meta <- rggu.meta %>%
+  rename(file = `link-href`) %>% 
+  mutate(filename = str_trunc(file, 11, ellipsis = "", side = "left")) %>%
+  select("author", "title", "filename")
+
+# задаем пути к файлам
+rggu.files <- paste("rggu/rsl", rggu.meta$filename, sep="")
+rggu.files <- rggu.files %>% paste(".txt", sep = "")
+names(rggu.files) <- rggu.meta$filename
+
+# загружаем тексты
+rggu.texts <- bind_rows(lapply(rggu.files, read_file), .id="filename")
+rggu.texts <- t(rggu.texts)
+rggu.texts <- tibble(rggu.texts)
+
+# объединяем тексты и мета-данные в датафрейм
+rggu <- bind_cols(rggu.texts, rggu.meta) %>%
+  rename(text = rggu.texts) %>%
+  select(author, title, filename, text) %>%
+  # достаем из названия год
+  mutate(year = str_trunc(title, 13, ellipsis = "", side = "left")) %>%
+  mutate(year = str_trunc(year, 4, ellipsis = ""))
+
+rggu[24, 5] <- "2010"
+rggu[108, 5] <- "2019"
+rggu[117, 5] <- "2022"
+rggu[128, 5] <- "2022"
+rggu[215, 5] <- "2019"
+rggu[258, 5] <- "2020"
+rggu[24, 5] <- "2010"
+
+rggu$year <- as.numeric(rggu$year)
+
+str(rggu)
+```
+
+Препроцессинг корпуса РГГУ
+
+
+```{r}
+# удаляем пунктуацию, цифры, разрывы строк, латиницу, лишние пробелы
+rggu$clean <- gsub("[[:punct:]]", " ", rggu$text)
+rggu$clean <- str_replace_all(rggu$clean, "[0-9]+", " ")
+rggu$clean <- str_replace_all(rggu$clean, "[\\n\t\r]+", " ")
+rggu$clean <- str_replace_all(rggu$clean, "[A-Za-z]+", " ")
+rggu$clean <- str_squish(rggu$clean)
+
+head(rggu, 2)
+```
+
+Для дальнейшего использования mystem я делю тексты на фрагменты по 50 слов. Так можно совершать параллельные вычисления. Также на моем ноутбуке возникает ошибка в работе mystem при слишком большой длине строк.
+
+
+```{r}
+rggu.words <- rggu %>% 
+  unnest_tokens(word, clean) %>%  
+  mutate(id = row_number() %/% 50) %>% 
+  group_by(author, title, filename, id) %>%
+  summarize(clean = paste(word, collapse=" "))
+
+head(rggu.words)
+```
+
+Используем mystem с определением частей речи и имен
+
+```{r}
+rggu.words$clean <- system2("C:/Users/79175/Documents/rwd/mystem.exe", c("-d", "-l", "-c", "-ig"), input = rggu.words$clean, stdout = TRUE)
+rggu.words <- rggu.words %>% ungroup()
+
+#write.csv(rggu.words, "rggu_words.csv", fileEncoding = "UTF-8")
+
+rggu.gram <- rggu.words %>% unnest_tokens(gram, clean, token = stringr::str_extract_all, pattern="\\w+=[A-Z]+,*(имя|фам|отч)*")
+
+head(rggu.gram)
+```
+
+Частотности
+
+```{r}
+
+rggu.freq <- rggu.gram %>% count(gram, sort=TRUE)
+
+head(rggu.freq, 20)
+
+```
+
+Разделим колонку со словами на лемму, часть речи и характеристики (ФИО), чтобы затем убрать последние. Тогда они не будут влиять на результаты обучения модели.
+
+```{r}
+rggu.lempos <- rggu.gram %>%
+  separate(gram, c("lemma", "pos"), sep = "=") %>%
+  separate(pos, c("pos", "prop"), sep = ",")
+
+head(rggu.lempos)
+```
+
+Чистим корпус от имен и стоп-слов
+
+```{r}
+
+#stopwords1 <- read_csv("stopwords1.csv")         # список стоп-слов был загружен ранее
+
+rggu.clean <- rggu.lempos %>% 
+  filter(pos %in% c("s", "v", "a", "adv")) %>%
+  filter(!str_detect(prop, "имя|фам|отч")) %>%   # удаляем имена
+  filter(!lemma %in% stopwords1$word)
+View(head(rggu.clean))
+
+# частотности почищенного корпуса
+rggu.clean.freq <- rggu.clean %>% count(lemma, sort=TRUE)
+
+head(rggu.clean.freq, 20)
+```
+
+Делим на фрагменты для тематического моделирования
+
+```{r}
+rggu500 <- rggu.clean %>% 
+  mutate(id = row_number() %/% 500) %>%              # создаем фрагменты по 500 слов
+  group_by(filename, id) %>%
+  summarize(text = paste(lemma, collapse=" ")) %>%   # объединяем слова в фрагменты по id
+  mutate(docid = paste(filename, id, sep="."))       # присваиваем фрагменту id + имя файла
+
+```
+
+Сравним частотности в корпусах
+
+```{r}
+rggu.clean.freq <- rggu.clean.freq %>% 
+  mutate(id = row_number())
+rgsu.clean.freq <- rgsu.clean.freq %>% 
+  mutate(id = row_number())
+
+freqs <- rggu.clean.freq %>% 
+  full_join(rgsu.clean.freq, by = "id", suffix = c("_rggu", "_rgsu"))
+
+freqs
+```
+
+Объединяем корпусы РГГУ и РГСУ
+
+```{r}
+# несколько файлов изначально оказались сразу в двух корпусах, удаляю их 
+rggu.clean <- rggu.clean %>% 
+  filter(!filename %in% c(
+    "01003446244", "01005044909", "01005533920", "01005053212", "01005562949")) %>% 
+  mutate(uni = "РГГУ")
+
+rgsu.clean <- rgsu.clean %>% 
+  filter(!filename %in% c("01008591902", "01005044909", "01004606934", "01005533920")) %>% 
+  mutate(uni = "РГСУ")
+
+# объединяем
+dissers <- bind_rows(rggu.clean, rgsu.clean)
+
+# присваиваем id по номеру файла
+file_id <- data.frame(unique(dissers$filename), seq(1, 448))
+names(file_id) <- c("filename", "sent_id")
+
+dissers <- dissers %>%
+  select(title, author, uni, lemma, filename) %>%
+  inner_join(file_id, by = "filename")
+
+# количество слов в корпусах
+dissers %>% count(uni) 
+```
+
+Пора почистить оружение
+
+```{r}
+rm(rggu)
+rm(rgsu)
+rm(rggu.gram)
+rm(rggu.lempos)
+rm(rgsu.gram)
+rm(rgsu.lempos)
+rm(rggu.texts)
+rm(rgsu.texts)
+rm(rggu.words)
+rm(rgsu.words)
+rm(rggu.meta)
+rm(rgsu.meta)
+rm(rgsu.clean)
+rm(rggu.clean)
+```
+
+Создаем терм-документную матрицу для обучения классификатора с помощью меры TF-IDF
+
+```{r}
+dis.longmeta <- dissers %>% 
+  distinct(uni, sent_id, filename)
+
+dis.nested <- dissers %>%
+  tidyr::nest(lemma) %>%
+  mutate(text = map(data, unlist), 
+         text = map_chr(text, paste, collapse = " ")) 
+
+dis.dtm <- dissers %>%
+    count(sent_id, lemma) %>%
+    bind_tf_idf(lemma, sent_id, n) %>% 
+    cast_dfm(sent_id, lemma, tf_idf)
+dis.dtm
+
+dis.clean <- dis.dtm %>%
+    dfm_wordstem(language = "ru") 
+#    dfm_trim(min_docfreq=0.1) 
+dis.clean
+
+```
+
+Делим корпус на тестовый и тренировочный (10% выборка)
+
+```{r}
+
+set.seed(31)
+
+split <- createDataPartition(y = dis.nested$uni, p = 0.9, list = FALSE)
+train.data <- dis.clean %>%       # обучающая выборка
+  dfm_subset(rownames(dis.clean) %in% dis.longmeta$sent_id[split])
+test.data <- dis.clean %>%        # тестовая выборка
+  dfm_subset(!rownames(dis.clean) %in% dis.longmeta$sent_id[split]) 
+
+response <- as.factor(dis.nested$uni)
+trainY <- response[split]
+testY <- response[-split]
+```
+
+Обучаем модель
+
+```{r}
+cv.elasticnet <- cv.glmnet(x = train.data, y = trainY, family = "binomial", type.measure="auc", nfolds = 5, standardize=FALSE)
+```
+
+Предсказываем, в каком университете написана работа
+
+```{r}
+predicted.elasticnet <- as.factor(predict(cv.elasticnet, test.data, type="class"))
+cm.elasticnet <- confusionMatrix(data = predicted.elasticnet, reference = testY, positive="РГГУ")
+cm.elasticnet
+```
+
+Анализируем ошибки
+
+```{r}
+test.df <- dissers[-split,]
+misclassified.rggu <- test.df[which(predicted.elasticnet == "РГСУ" & testY == "РГГУ"),]
+misclassified.rggu %>%
+    count(sent_id, lemma) %>%
+    cast_dfm(sent_id, lemma, n) %>%
+    textplot_wordcloud(min_count=0.01, ordered_color=TRUE)
+
+```
+
+Модель звезд с неба не хватает...
